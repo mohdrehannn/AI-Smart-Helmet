@@ -1,4 +1,4 @@
-# A/I-Smart-Helmet
+# AI-Smart-Helmet
 ## Smart Helmet with Accident Detection and
 Emergency Alert System
 Objective: To develop a safety system for riders that can automatically detect accidents and

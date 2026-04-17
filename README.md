@@ -40,3 +40,11 @@ Connectivity & Support:
 - Connecting wires and PCB/board setup
 Summary: The system enhances rider safety by detecting accidents, monitoring drowsiness, and
 ensuring emergency communication through SMS and calls.
+
+
+
+By Aiml students 
+Mohd Rehan Rahemath - 160922729301
+Mohd Abdul Sami - 160922729302
+Naymat Baig - 16092272957
+Syed Mujtaba - 160922729304

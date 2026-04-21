@@ -1,0 +1,533 @@
+
+import dbus
+import dbus.mainloop.glib
+import dbus.service
+import json
+import logging
+import os
+import time
+from gi.repository import GLib
+from threading import Thread, Event, Lock
+from esp import add_esp_characteristic
+# ─────────────────────────────────────────────────────────────────────────────
+# LOGGING
+# ─────────────────────────────────────────────────────────────────────────────
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [BLE] %(levelname)-8s %(message)s",
+)
+log = logging.getLogger("BLE")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CONSTANTS
+# ─────────────────────────────────────────────────────────────────────────────
+BLUEZ_SERVICE          = "org.bluez"
+GATT_MANAGER_IFACE     = "org.bluez.GattManager1"
+LE_AD_MANAGER_IFACE    = "org.bluez.LEAdvertisingManager1"
+LE_ADVERTISEMENT_IFACE = "org.bluez.LEAdvertisement1"
+GATT_SERVICE_IFACE     = "org.bluez.GattService1"
+GATT_CHRC_IFACE        = "org.bluez.GattCharacteristic1"
+DBUS_PROP_IFACE        = "org.freedesktop.DBus.Properties"
+DBUS_OM_IFACE          = "org.freedesktop.DBus.ObjectManager"
+
+SERVICE_UUID        = "12345678-1234-5678-1234-56789abcdef0"
+CHARACTERISTIC_UUID = "abcdef01-1234-5678-1234-56789abcdef0"
+DEVICE_NAME         = "SMART_HELMET"
+ADAPTER_PATH        = "/org/bluez/hci0"
+
+RIDER_FILE     = "rider.json"
+STATUS_FILE    = "ble_status.txt"
+TELEMETRY_FILE = "telemetry.json"
+
+DEFAULT_RIDER = {
+    "name": "Unknown", "blood": "-", "contact": "-",
+    "allergies": "-",  "belongings": "-", "medical": "-",
+}
+DEFAULT_TELEMETRY = {
+    "g": 1.0, "speed": 0.0,
+    "lat": "17.3422348", "lon": "78.3674875",
+    "gps_fix": 0, "crash": 0, "battery": 85,
+    "demo": 0, "drowsy": 0,
+}
+
+# ─────────────────────────────────────────────────────────────────────────────
+# FILE HELPERS
+# ─────────────────────────────────────────────────────────────────────────────
+_tele_lock  = Lock()
+_tele_cache = DEFAULT_TELEMETRY.copy()
+
+
+def _read_json(path: str, default: dict) -> dict:
+    """Read a JSON file; return default dict on any failure. Never raises."""
+    try:
+        if os.path.exists(path):
+            with open(path, "r") as f:
+                return json.load(f)
+    except Exception as e:
+        log.warning(f"Read {path}: {e}")
+    return default.copy()
+
+
+def _write_json(path: str, data: dict) -> bool:
+    """Write JSON safely; silently returns False on error. Never raises."""
+    try:
+        with open(path, "w") as f:
+            json.dump(data, f, indent=2)
+        return True
+    except Exception as e:
+        log.error(f"Write {path}: {e}")
+        return False
+
+
+def _set_status(status: str) -> None:
+    try:
+        with open(STATUS_FILE, "w") as f:
+            f.write(status)
+    except Exception as e:
+        log.error(f"Status write: {e}")
+
+
+def _get_telemetry() -> dict:
+    """
+    Read telemetry.json written atomically by test.py (os.replace pattern).
+    Falls back to cached values on any read error.
+    """
+    global _tele_cache
+    try:
+        data = _read_json(TELEMETRY_FILE, DEFAULT_TELEMETRY)
+        with _tele_lock:
+            _tele_cache = data
+        return data
+    except Exception:
+        with _tele_lock:
+            return dict(_tele_cache)
+
+
+def _format_payload(t: dict) -> str:
+    """
+    Serialise telemetry dict into the BLE notification string.
+    Format: G:1.02;SPD:34.5;LAT:17.342;LON:78.367;GPS:1;CRASH:0;BTRY:87;DEMO:0;DRWSY:0
+    """
+    return (
+        f"G:{float(t.get('g', 1.0)):.2f}"
+        f";SPD:{float(t.get('speed', 0.0)):.1f}"
+        f";LAT:{t.get('lat', '17.3422348')}"
+        f";LON:{t.get('lon', '78.3674875')}"
+        f";GPS:{int(t.get('gps_fix', 0))}"
+        f";CRASH:{int(t.get('crash', 0))}"
+        f";BTRY:{int(t.get('battery', 85))}"
+        f";DEMO:{int(t.get('demo', 0))}"
+        f";DRWSY:{int(t.get('drowsy', 0))}"
+    )
+
+
+def _init_files() -> None:
+    """Create stub files so test.py and the app have something to read."""
+    if not os.path.exists(RIDER_FILE):
+        _write_json(RIDER_FILE, DEFAULT_RIDER)
+    if not os.path.exists(TELEMETRY_FILE):
+        _write_json(TELEMETRY_FILE, DEFAULT_TELEMETRY)
+    if not os.path.exists(STATUS_FILE):
+        _set_status("DISCONNECTED")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ADVERTISEMENT
+# ─────────────────────────────────────────────────────────────────────────────
+class HelmetAdvertisement(dbus.service.Object):
+    """LE peripheral advertisement — broadcasts SMART_HELMET + service UUID."""
+
+    PATH = "/org/bluez/helmet/advertisement0"
+
+    def __init__(self, bus: dbus.SystemBus) -> None:
+        dbus.service.Object.__init__(self, bus, self.PATH)
+
+    def get_path(self) -> dbus.ObjectPath:
+        return dbus.ObjectPath(self.PATH)
+
+    def _props(self) -> dict:
+        return {
+            LE_ADVERTISEMENT_IFACE: {
+                "Type":        dbus.String("peripheral"),
+                "LocalName":   dbus.String(DEVICE_NAME),
+                "ServiceUUIDs": dbus.Array([SERVICE_UUID], signature="s"),
+                "Includes":    dbus.Array(["tx-power"], signature="s"),
+            }
+        }
+
+    # ── DBus Property interface ───────────────────────────────────────────────
+    @dbus.service.method(DBUS_PROP_IFACE, in_signature="ss", out_signature="v")
+    def Get(self, interface: str, prop: str):
+        try:
+            return self._props()[interface][prop]
+        except KeyError:
+            raise dbus.exceptions.DBusException(
+                f"org.freedesktop.DBus.Error.InvalidArgs: {prop}"
+            )
+
+    @dbus.service.method(DBUS_PROP_IFACE, in_signature="s", out_signature="a{sv}")
+    def GetAll(self, interface: str):
+        try:
+            return self._props()[interface]
+        except KeyError:
+            raise dbus.exceptions.DBusException(
+                f"org.freedesktop.DBus.Error.InvalidArgs: {interface}"
+            )
+
+    # ── Required by BlueZ ─────────────────────────────────────────────────────
+    @dbus.service.method(LE_ADVERTISEMENT_IFACE, in_signature="", out_signature="")
+    def Release(self) -> None:
+        log.info("Advertisement released by BlueZ")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# APPLICATION (ObjectManager)
+# ─────────────────────────────────────────────────────────────────────────────
+class HelmetApplication(dbus.service.Object):
+    """
+    Root ObjectManager: BlueZ calls GetManagedObjects to discover
+    all GATT services and characteristics.
+    """
+
+    PATH = "/"
+
+    def __init__(self, bus: dbus.SystemBus) -> None:
+        dbus.service.Object.__init__(self, bus, self.PATH)
+        self._services: list = []
+
+    def get_path(self) -> dbus.ObjectPath:
+        return dbus.ObjectPath(self.PATH)
+
+    def add_service(self, service: "HelmetGattService") -> None:
+        self._services.append(service)
+
+    @dbus.service.method(DBUS_OM_IFACE, out_signature="a{oa{sa{sv}}}")
+    def GetManagedObjects(self):
+        objects = {}
+        for svc in self._services:
+            objects[svc.get_path()] = svc.get_properties()
+            for chrc in svc.characteristics:
+                objects[chrc.get_path()] = chrc.get_properties()
+        return objects
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GATT SERVICE
+# ─────────────────────────────────────────────────────────────────────────────
+class HelmetGattService(dbus.service.Object):
+    PATH = "/org/bluez/helmet/service0"
+
+    def __init__(self, bus: dbus.SystemBus) -> None:
+        dbus.service.Object.__init__(self, bus, self.PATH)
+        self.characteristics: list = []
+
+    def get_path(self) -> dbus.ObjectPath:
+        return dbus.ObjectPath(self.PATH)
+
+    def add_characteristic(self, chrc: "HelmetCharacteristic") -> None:
+        self.characteristics.append(chrc)
+
+    def get_properties(self) -> dict:
+        return {
+            GATT_SERVICE_IFACE: {
+                "UUID":    dbus.String(SERVICE_UUID),
+                "Primary": dbus.Boolean(True),
+                "Characteristics": dbus.Array(
+                    [c.get_path() for c in self.characteristics],
+                    signature="o",
+                ),
+            }
+        }
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GATT CHARACTERISTIC
+#
+# ROOT CAUSE OF THE ORIGINAL BUG
+# ────────────────────────────────
+# @dbus.service.method decorators with in_signature="" still allocate
+# one parameter slot (self).  Any extra in_signature character maps to
+# one additional positional argument.  The original StartNotify had
+# in_signature="a{sv}" which told dbus-python to pass one argument —
+# but the function signature was def StartNotify(self), i.e. no room
+# for that argument → "input signature is longer than the number of
+# arguments taken".
+#
+# FIX APPLIED
+# ────────────────────────────────
+# StartNotify: in_signature=""   (no arguments beyond self)
+# StopNotify:  in_signature=""   (no arguments beyond self)
+# WriteValue:  in_signature="aya{sv}"  → (self, value, options) ✓
+#              This was correct in v3.0 but WriteValue is preserved
+#              because some BlueZ versions call it WITH options dict.
+# ─────────────────────────────────────────────────────────────────────────────
+class HelmetCharacteristic(dbus.service.Object):
+    PATH = "/org/bluez/helmet/service0/char0"
+
+    def __init__(self, bus: dbus.SystemBus, service: HelmetGattService) -> None:
+        dbus.service.Object.__init__(self, bus, self.PATH)
+        self._service   = service
+        self._notifying = False
+        self._stop_evt  = Event()   # signals the notification thread to exit
+
+    def get_path(self) -> dbus.ObjectPath:
+        return dbus.ObjectPath(self.PATH)
+
+    def get_properties(self) -> dict:
+        return {
+            GATT_CHRC_IFACE: {
+                "Service": self._service.get_path(),
+                "UUID":    dbus.String(CHARACTERISTIC_UUID),
+                "Flags":   dbus.Array(
+                    ["notify", "write", "write-without-response"],
+                    signature="s",
+                ),
+            }
+        }
+
+    # ── READ (optional, satisfies some BlueZ versions) ───────────────────────
+    @dbus.service.method(GATT_CHRC_IFACE, in_signature="a{sv}", out_signature="ay")
+    def ReadValue(self, options: dict):
+        try:
+            payload = _format_payload(_get_telemetry())
+            return dbus.Array([dbus.Byte(b) for b in payload.encode()], signature="y")
+        except Exception as e:
+            log.error(f"ReadValue: {e}")
+            return dbus.Array([], signature="y")
+
+    # ── WRITE — rider profile arrives from the Flutter app ───────────────────
+    # Signature "aya{sv}" → two positional args after self: value, options
+    @dbus.service.method(GATT_CHRC_IFACE, in_signature="aya{sv}", out_signature="")
+    def WriteValue(self, value, options) -> None:
+        try:
+            text = bytes(value).decode("utf-8", errors="replace").strip()
+            log.info(f"WriteValue received: {text}")
+            _parse_and_save_rider(text)
+        except Exception as e:
+            log.error(f"WriteValue: {e}")
+
+    # ── START NOTIFY
+    # !! in_signature MUST be "" — no arguments. !!
+    # BlueZ calls StartNotify() with no arguments; adding any signature
+    # character causes "input signature is longer than arguments" ValueError.
+    @dbus.service.method(GATT_CHRC_IFACE, in_signature="", out_signature="")
+    def StartNotify(self) -> None:
+        if self._notifying:
+            log.warning("StartNotify called while already notifying — restarting")
+            self._stop_evt.set()        # signal old thread to stop
+            time.sleep(0.15)            # let it exit cleanly
+
+        self._stop_evt.clear()
+        self._notifying = True
+        _set_status("CONNECTED")
+        log.info("Notifications started")
+
+        Thread(target=self._notify_loop, daemon=True, name="notify").start()
+
+    # ── STOP NOTIFY
+    # !! in_signature MUST be "" — same reason as StartNotify. !!
+    @dbus.service.method(GATT_CHRC_IFACE, in_signature="", out_signature="")
+    def StopNotify(self) -> None:
+        if not self._notifying:
+            log.warning("StopNotify called while not notifying")
+            return
+        self._notifying = False
+        self._stop_evt.set()
+        _set_status("DISCONNECTED")
+        log.info("Notifications stopped")
+
+    # ── NOTIFICATION LOOP (runs in a daemon thread) ───────────────────────────
+    def _notify_loop(self) -> None:
+        """
+        Sends telemetry payload once per second via PropertiesChanged signal.
+
+        Design choices for Pi Zero 2W:
+        - Event.wait(1.0) instead of time.sleep: wakes immediately on stop.
+        - Telemetry read is I/O-bound; failures fall back to cached values.
+        - PropertiesChanged is caught individually so one bad packet doesn't
+          kill the loop.
+        """
+        log.info("Notification thread running")
+        while self._notifying and not self._stop_evt.is_set():
+            try:
+                payload = _format_payload(_get_telemetry())
+                value   = dbus.Array(
+                    [dbus.Byte(b) for b in payload.encode()],
+                    signature="y",
+                )
+                self.PropertiesChanged(
+                    GATT_CHRC_IFACE,
+                    {"Value": value},
+                    dbus.Array([], signature="s"),
+                )
+                log.debug(f"Notified: {payload}")
+            except dbus.exceptions.DBusException as e:
+                # Client disconnected mid-notification — stop gracefully
+                log.warning(f"DBus notify error (client likely disconnected): {e}")
+                break
+            except Exception as e:
+                log.error(f"Notify loop error: {e}")
+
+            # Non-busy 1-second wait; exits immediately if stop_evt fires
+            self._stop_evt.wait(timeout=1.0)
+
+        self._notifying = False
+        log.info("Notification thread exited")
+
+    # ── DBus signal declaration ───────────────────────────────────────────────
+    @dbus.service.signal(DBUS_PROP_IFACE, signature="sa{sv}as")
+    def PropertiesChanged(self, interface, changed, invalidated):
+        pass  # Signal body is empty — DBus handles dispatch
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# RIDER PROFILE PARSER
+# ─────────────────────────────────────────────────────────────────────────────
+_FIELD_MAP = {
+    "name":       "name",
+    "blood":      "blood",
+    "contact":    "contact",
+    "allergies":  "allergies",
+    "belongings": "belongings",
+    "medical":    "medical",
+}
+
+def _parse_and_save_rider(raw: str) -> None:
+    """
+    Parse "NAME:John;BLOOD:O+;..." and merge into rider.json.
+    Unknown keys are silently ignored.
+    """
+    updates: dict = {}
+    for part in raw.split(";"):
+        if ":" not in part:
+            continue
+        key, _, val = part.partition(":")
+        key = key.strip().lower()
+        val = val.strip()
+        if key in _FIELD_MAP:
+            updates[_FIELD_MAP[key]] = val
+
+    if not updates:
+        log.warning("WriteValue: no recognised fields in payload")
+        return
+
+    existing = _read_json(RIDER_FILE, DEFAULT_RIDER)
+    existing.update(updates)
+    _write_json(RIDER_FILE, existing)
+    log.info(f"Rider profile saved: name={existing.get('name', '?')}")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# CONNECTION MONITOR
+# ─────────────────────────────────────────────────────────────────────────────
+def _monitor_connections(bus: dbus.SystemBus) -> None:
+    """
+    Listens for BlueZ PropertiesChanged on Device1 objects.
+    Updates ble_status.txt on connect / disconnect.
+    """
+    def _callback(interface, changed, invalidated, path=""):
+        if interface != "org.bluez.Device1":
+            return
+        if "Connected" in changed:
+            connected = bool(changed["Connected"])
+            status    = "CONNECTED" if connected else "DISCONNECTED"
+            _set_status(status)
+            icon = "🔵" if connected else "🔴"
+            log.info(f"{icon} Device {status.lower()}: {path}")
+
+    bus.add_signal_receiver(
+        _callback,
+        dbus_interface=DBUS_PROP_IFACE,
+        signal_name="PropertiesChanged",
+        path_keyword="path",
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# MAIN
+# ─────────────────────────────────────────────────────────────────────────────
+def main() -> None:
+    print("╔══════════════════════════════════════════════════════╗")
+    print("║    SMART HELMET BLE Server v4.0  —  Starting         ║")
+    print(f"║    Device : {DEVICE_NAME:<41}║")
+    print(f"║    SVC    : {SERVICE_UUID[:38]:<41}║")
+    print(f"║    CHRC   : {CHARACTERISTIC_UUID[:38]:<41}║")
+    print("╚══════════════════════════════════════════════════════╝")
+
+    _init_files()
+
+    # ── DBus setup ────────────────────────────────────────────────────────────
+    dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
+    bus = dbus.SystemBus()
+
+    # ── Bluetooth adapter ─────────────────────────────────────────────────────
+    try:
+        adapter_obj   = bus.get_object(BLUEZ_SERVICE, ADAPTER_PATH)
+        adapter_props = dbus.Interface(adapter_obj, DBUS_PROP_IFACE)
+        adapter_props.Set(
+            "org.bluez.Adapter1", "Powered", dbus.Boolean(True)
+        )
+        log.info("Bluetooth adapter powered on")
+    except Exception as e:
+        log.error(f"Adapter error: {e}")
+        return
+
+    # ── BlueZ managers ────────────────────────────────────────────────────────
+    try:
+        gatt_mgr = dbus.Interface(adapter_obj, GATT_MANAGER_IFACE)
+        ad_mgr   = dbus.Interface(adapter_obj, LE_AD_MANAGER_IFACE)
+    except Exception as e:
+        log.error(f"Manager error: {e}")
+        return
+
+    # ── Build GATT object tree ────────────────────────────────────────────────
+    app   = HelmetApplication(bus)
+    svc   = HelmetGattService(bus)
+    chrc  = HelmetCharacteristic(bus, svc)
+    adv   = HelmetAdvertisement(bus)
+
+    svc.add_characteristic(chrc)
+    esp_chrc = add_esp_characteristic(bus, svc)
+    app.add_service(svc)
+
+    _monitor_connections(bus)
+
+    # ── Register GATT application ─────────────────────────────────────────────
+    try:
+        gatt_mgr.RegisterApplication(
+            app.get_path(), {},
+            reply_handler=lambda:     log.info("GATT application registered"),
+            error_handler=lambda err: log.error(f"GATT register error: {err}"),
+        )
+    except Exception as e:
+        log.error(f"RegisterApplication: {e}")
+        return
+
+    # ── Register advertisement ────────────────────────────────────────────────
+    try:
+        ad_mgr.RegisterAdvertisement(
+            adv.get_path(), {},
+            reply_handler=lambda:     log.info(f"Advertising as {DEVICE_NAME}"),
+            error_handler=lambda err: log.error(f"Advertisement error: {err}"),
+        )
+    except Exception as e:
+        log.error(f"RegisterAdvertisement: {e}")
+        return
+
+    # ── Run GLib mainloop ─────────────────────────────────────────────────────
+    mainloop = GLib.MainLoop()
+    log.info("BLE server running — press Ctrl+C to stop")
+
+    try:
+        mainloop.run()
+    except KeyboardInterrupt:
+        log.info("Stopped by user")
+    except Exception as e:
+        log.error(f"Mainloop error: {e}")
+    finally:
+        _set_status("DISCONNECTED")
+        log.info("BLE server shutdown complete")
+
+
+if __name__ == "__main__":
+    main()

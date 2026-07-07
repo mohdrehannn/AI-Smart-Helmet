@@ -13,7 +13,7 @@
 
 ### Intelligent Accident Detection & Emergency Alert System
 
-*Powered by Raspberry Pi Zero 2W · Built by AIML Students, Lords Institute of Engineering and Technology*
+*Powered by Raspberry Pi Zero 2W · Built by Rehan*
 
 -----
 
@@ -510,22 +510,6 @@ https://maps.google.com/?q=17.342234,78.367487
 - Drowsiness head-nod FSM
 - Full ANSI dashboard terminal UI
 - BLE telemetry JSON output
-
------
-
-## Team
-
-**Department of Artificial Intelligence and Machine Learning**
-**Lords Institute of Engineering and Technology, Hyderabad**
-*(Affiliated with Osmania University)*
-
-|Name               |Roll Number |
-|-------------------|------------|
-|Mohd Rehan Rahemath|160922729301|
-|Mohd Abdul Sami    |160922729302|
-|Naymat Baig        |160922729057|
-|Syed Mujtaba       |160922729304|
-
 -----
 
 ## License
